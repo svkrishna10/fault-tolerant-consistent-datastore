@@ -1,7 +1,6 @@
 package server.faulttolerance;
 
-import com.datastax.driver.core.Cluster;
-import com.datastax.driver.core.Session;
+import com.datastax.driver.core.*;
 import edu.umass.cs.nio.AbstractBytePacketDemultiplexer;
 import edu.umass.cs.nio.MessageNIOTransport;
 import edu.umass.cs.nio.interfaces.NodeConfig;
@@ -16,31 +15,25 @@ import org.json.JSONObject;
 
 import java.io.IOException;
 import java.net.InetSocketAddress;
-import java.util.Collections;
-import java.util.List;
+import java.util.*;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
-/**
- * ZooKeeper Fault Tolerant Server.
- * Implements Leader Election and Shared Log consensus using ZooKeeper.
- */
 public class MyDBFaultTolerantServerZK extends MyDBSingleServer implements Watcher {
 
     public static final int SLEEP = 100;
     public static final boolean DROP_TABLES_AFTER_TESTS = true;
     public static final int MAX_LOG_SIZE = 400;
     public static final int DEFAULT_PORT = 2181;
+    private static final int CHECKPOINT_INTERVAL = 200; // Checkpoint every 200 requests
 
     private final ZooKeeper zk;
     private final String electionPath = "/election";
     private final String logPath = "/log";
+    private final String checkpointPath = "/checkpoint";
     private final String myID;
     
-    // Server-to-Server Messenger (Required because MyDBSingleServer doesn't have one)
     protected final MessageNIOTransport<String, String> serverMessenger;
-
-    // Explicit session management to ensure control
     private final Session session;
     private final Cluster cluster;
 
@@ -48,11 +41,10 @@ public class MyDBFaultTolerantServerZK extends MyDBSingleServer implements Watch
     private volatile boolean isLeader = false;
     private volatile String currentLeader = null;
     
-    // Track execution to ensure total ordering
     private int lastExecutedSeq = -1;
+    private int lastCheckpointedSeq = -1;
 
     public MyDBFaultTolerantServerZK(NodeConfig<String> nodeConfig, String myID, InetSocketAddress isaDB) throws IOException {
-        // Fix 1: Correct super constructor call (ISA, ISA, String)
         super(new InetSocketAddress(nodeConfig.getNodeAddress(myID), 
                 nodeConfig.getNodePort(myID) - ReplicatedServer.SERVER_PORT_OFFSET), 
               isaDB, 
@@ -60,7 +52,6 @@ public class MyDBFaultTolerantServerZK extends MyDBSingleServer implements Watch
         
         this.myID = myID;
 
-        // Fix 2: Initialize serverMessenger for forwarding requests
         this.serverMessenger = new MessageNIOTransport<String, String>(myID, nodeConfig, 
             new AbstractBytePacketDemultiplexer() {
                 @Override
@@ -70,23 +61,17 @@ public class MyDBFaultTolerantServerZK extends MyDBSingleServer implements Watch
                 }
             }, true);
 
-        // Establish DB Connection
         this.cluster = Cluster.builder().addContactPoint("127.0.0.1").build();
         this.session = cluster.connect(myID);
 
-        // Connect to ZooKeeper
         this.zk = new ZooKeeper("localhost:" + DEFAULT_PORT, 3000, this);
 
-        // Initialize ZK Structure
         initializeZK();
-
-        // Start Leader Election
+        restoreFromCheckpoint(); // CRITICAL: Restore before processing new requests
         runLeaderElection();
-
-        // Start Log Processing (Recovery & Watching)
         processLog();
         
-        Logger.getLogger(this.getClass().getName()).log(Level.INFO, "Server {0} started ZK init.", myID);
+        Logger.getLogger(this.getClass().getName()).log(Level.INFO, "Server {0} started.", myID);
     }
 
     private void initializeZK() {
@@ -101,14 +86,16 @@ public class MyDBFaultTolerantServerZK extends MyDBSingleServer implements Watch
                     zk.create(logPath, new byte[0], ZooDefs.Ids.OPEN_ACL_UNSAFE, CreateMode.PERSISTENT);
                 } catch (KeeperException.NodeExistsException e) {}
             }
+            if (zk.exists(checkpointPath, false) == null) {
+                try {
+                    zk.create(checkpointPath, new byte[0], ZooDefs.Ids.OPEN_ACL_UNSAFE, CreateMode.PERSISTENT);
+                } catch (KeeperException.NodeExistsException e) {}
+            }
         } catch (Exception e) {
             e.printStackTrace();
         }
     }
 
-    /**
-     * Leader Election: Smallest Ephemeral Sequential node wins.
-     */
     private synchronized void runLeaderElection() {
         try {
             if (myZnodeId == null) {
@@ -126,11 +113,9 @@ public class MyDBFaultTolerantServerZK extends MyDBSingleServer implements Watch
                 this.currentLeader = myID;
             } else {
                 this.isLeader = false;
-                // Get leader ID from data
                 byte[] data = zk.getData(electionPath + "/" + leaderNode, false, null);
                 this.currentLeader = new String(data);
                 
-                // Watch the node immediately preceding me (avoid herd effect)
                 int myIndex = -1;
                 for(int i=0; i<children.size(); i++) {
                     if(myZnodeId.endsWith(children.get(i))) {
@@ -140,7 +125,6 @@ public class MyDBFaultTolerantServerZK extends MyDBSingleServer implements Watch
                 if (myIndex > 0) {
                     zk.exists(electionPath + "/" + children.get(myIndex - 1), this);
                 } else {
-                    // Fallback watch leader
                     zk.exists(electionPath + "/" + leaderNode, this);
                 }
             }
@@ -149,10 +133,6 @@ public class MyDBFaultTolerantServerZK extends MyDBSingleServer implements Watch
         }
     }
 
-    /**
-     * Handle Client Requests.
-     * Logic: Wraps request with Sender ID and writes to ZK Log (if Leader) or Forwards to Leader.
-     */
     @Override
     protected void handleMessageFromClient(byte[] bytes, NIOHeader header) {
         String request = new String(bytes);
@@ -160,21 +140,13 @@ public class MyDBFaultTolerantServerZK extends MyDBSingleServer implements Watch
 
         if (isLeader) {
             try {
-                // Prune logs if needed
-                pruneLogs();
-
-                // Format: "SENDER_ID:REQUEST_DATA"
-                // This allows us to reply to the correct node after consensus
                 String payload = sender + "::" + request;
-                
                 zk.create(logPath + "/entry-", payload.getBytes(), 
                           ZooDefs.Ids.OPEN_ACL_UNSAFE, CreateMode.PERSISTENT_SEQUENTIAL);
-                
             } catch (Exception e) {
                 e.printStackTrace();
             }
         } else {
-            // Forward to Leader
             if (currentLeader != null && !currentLeader.equals(myID)) {
                 try {
                     this.serverMessenger.send(currentLeader, bytes);
@@ -185,29 +157,25 @@ public class MyDBFaultTolerantServerZK extends MyDBSingleServer implements Watch
         }
     }
 
-    // Fix 3: Removed @Override since parent MyDBSingleServer does not define this.
     protected void handleMessageFromServer(byte[] bytes, NIOHeader header) {
-        // Treat forwarded requests exactly like client requests
         handleMessageFromClient(bytes, header);
     }
 
-    /**
-     * Core Consensus Loop: Watches ZK Log and executes in order.
-     */
     private synchronized void processLog() {
         try {
-            List<String> logs = zk.getChildren(logPath, this); // Set watch
+            List<String> logs = zk.getChildren(logPath, this);
+            if (logs.isEmpty()) return;
+            
             Collections.sort(logs);
 
             for (String node : logs) {
-                // node name format: entry-000000001
                 int seq = Integer.parseInt(node.substring(node.indexOf("-") + 1));
 
+                // Only process logs AFTER our last executed sequence
                 if (seq > lastExecutedSeq) {
                     byte[] data = zk.getData(logPath + "/" + node, false, null);
                     String payload = new String(data);
                     
-                    // Parse "SENDER:REQUEST"
                     String sender = null;
                     String cmd = payload;
                     if (payload.contains("::")) {
@@ -216,11 +184,19 @@ public class MyDBFaultTolerantServerZK extends MyDBSingleServer implements Watch
                         cmd = parts[1];
                     }
 
-                    // EXECUTE
                     executeAndReply(cmd, sender, seq);
-                    
                     lastExecutedSeq = seq;
+                    
+                    // Checkpoint periodically (only if leader)
+                    if (isLeader && (lastExecutedSeq - lastCheckpointedSeq) >= CHECKPOINT_INTERVAL) {
+                        createCheckpoint();
+                    }
                 }
+            }
+            
+            // Prune old logs after processing (only if leader)
+            if (isLeader) {
+                pruneLogs();
             }
         } catch (Exception e) {
             e.printStackTrace();
@@ -229,7 +205,6 @@ public class MyDBFaultTolerantServerZK extends MyDBSingleServer implements Watch
 
     private void executeAndReply(String cmd, String sender, long seq) {
         try {
-            // Parse JSON if possible to extract SQL
             String query = cmd;
             JSONObject jsonReq = null;
             try {
@@ -237,42 +212,162 @@ public class MyDBFaultTolerantServerZK extends MyDBSingleServer implements Watch
                 if (jsonReq.has("REQUEST")) {
                     query = jsonReq.getString("REQUEST");
                 }
-            } catch (JSONException e) { /* Not JSON */ }
+            } catch (JSONException e) {}
 
-            // Execute on Cassandra
             session.execute(query);
 
-            // Construct Response
-            // Compatible with AVDBClient expectations
             String responseStr = "[success:" + cmd + "]";
             if (jsonReq != null) {
                 jsonReq.put("RESPONSE", responseStr);
                 responseStr = jsonReq.toString();
             }
 
-            // Send Response back to sender
-            // Only the node that sees the execution needs to reply.
-            // If sender is "unknown" or ourselves, handling varies.
             if (sender != null && !sender.equals("unknown")) {
                 this.serverMessenger.send(sender, responseStr.getBytes());
             }
-
         } catch (Exception e) {
             e.printStackTrace();
+        }
+    }
+
+    private void createCheckpoint() {
+        try {
+            // Snapshot the entire table state at this moment
+            ResultSet rs = session.execute("SELECT * FROM " + myID + ".grade");
+            StringBuilder snapshot = new StringBuilder();
+            snapshot.append(lastExecutedSeq).append("|");
+            
+            boolean first = true;
+            for (Row row : rs) {
+                int id = row.getInt("id");
+                List<Integer> events = row.getList("events", Integer.class);
+                
+                if (!first) snapshot.append(";");
+                first = false;
+                
+                snapshot.append(id).append(":");
+                for (int i = 0; i < events.size(); i++) {
+                    snapshot.append(events.get(i));
+                    if (i < events.size() - 1) snapshot.append(",");
+                }
+            }
+            
+            // Store checkpoint in ZK with the sequence number in the name
+            String cpNode = checkpointPath + "/cp-" + String.format("%010d", lastExecutedSeq);
+            try {
+                zk.create(cpNode, snapshot.toString().getBytes(), 
+                         ZooDefs.Ids.OPEN_ACL_UNSAFE, CreateMode.PERSISTENT);
+                lastCheckpointedSeq = lastExecutedSeq;
+                
+                Logger.getLogger(this.getClass().getName()).log(Level.INFO, 
+                    "Created checkpoint at seq " + lastExecutedSeq + " with data: " + snapshot.toString());
+            } catch (KeeperException.NodeExistsException e) {
+                // Checkpoint already exists for this sequence
+            }
+            
+        } catch (Exception e) {
+            e.printStackTrace();
+        }
+    }
+
+    private void restoreFromCheckpoint() {
+        try {
+            List<String> checkpoints = zk.getChildren(checkpointPath, false);
+            if (checkpoints.isEmpty()) {
+                lastExecutedSeq = -1;
+                lastCheckpointedSeq = -1;
+                Logger.getLogger(this.getClass().getName()).log(Level.INFO, 
+                    "No checkpoints found, starting from scratch");
+                return;
+            }
+            
+            Collections.sort(checkpoints);
+            String latestCp = checkpoints.get(checkpoints.size() - 1);
+            
+            byte[] data = zk.getData(checkpointPath + "/" + latestCp, false, null);
+            String snapshot = new String(data);
+            
+            Logger.getLogger(this.getClass().getName()).log(Level.INFO, 
+                "Restoring from checkpoint: " + latestCp + " with data: " + snapshot);
+            
+            if (snapshot.isEmpty()) {
+                lastExecutedSeq = -1;
+                lastCheckpointedSeq = -1;
+                return;
+            }
+            
+            String[] parts = snapshot.split("\\|", 2);
+            int checkpointSeq = Integer.parseInt(parts[0]);
+            
+            // Clear table first - start fresh from checkpoint
+            session.execute("TRUNCATE " + myID + ".grade");
+            
+            if (parts.length > 1 && !parts[1].isEmpty()) {
+                // Restore each row from checkpoint
+                String[] rows = parts[1].split(";");
+                for (String row : rows) {
+                    if (row.trim().isEmpty()) continue;
+                    
+                    String[] keyVal = row.split(":", 2);
+                    if (keyVal.length < 1) continue;
+                    
+                    int id = Integer.parseInt(keyVal[0]);
+                    
+                    if (keyVal.length > 1 && !keyVal[1].isEmpty()) {
+                        // Has events
+                        session.execute("INSERT INTO " + myID + ".grade (id, events) VALUES (" 
+                                       + id + ", [" + keyVal[1] + "])");
+                    } else {
+                        // Empty events list
+                        session.execute("INSERT INTO " + myID + ".grade (id, events) VALUES (" 
+                                       + id + ", [])");
+                    }
+                }
+            }
+            
+            // Set these AFTER successfully restoring data
+            lastExecutedSeq = checkpointSeq;
+            lastCheckpointedSeq = checkpointSeq;
+            
+            Logger.getLogger(this.getClass().getName()).log(Level.INFO, 
+                "Successfully restored from checkpoint at seq " + checkpointSeq);
+            
+        } catch (Exception e) {
+            // If restore fails, start from scratch
+            lastExecutedSeq = -1;
+            lastCheckpointedSeq = -1;
+            Logger.getLogger(this.getClass().getName()).log(Level.SEVERE, 
+                "Failed to restore from checkpoint, starting from scratch", e);
         }
     }
 
     private void pruneLogs() {
         try {
             List<String> logs = zk.getChildren(logPath, false);
-            if (logs.size() > MAX_LOG_SIZE) {
-                Collections.sort(logs);
-                // Remove oldest, keep last MAX_LOG_SIZE
-                for (int i = 0; i < logs.size() - MAX_LOG_SIZE; i++) {
-                    zk.delete(logPath + "/" + logs.get(i), -1);
+            if (logs.isEmpty()) return;
+            
+            Collections.sort(logs);
+            
+            // Calculate how many we can safely delete
+            // Keep at least MAX_LOG_SIZE entries, and never delete anything >= lastCheckpointedSeq
+            int canDelete = Math.max(0, logs.size() - MAX_LOG_SIZE);
+            
+            for (int i = 0; i < canDelete; i++) {
+                String log = logs.get(i);
+                int seq = Integer.parseInt(log.substring(log.indexOf("-") + 1));
+                
+                // Only delete if it's older than our checkpoint
+                if (seq < lastCheckpointedSeq) {
+                    try {
+                        zk.delete(logPath + "/" + log, -1);
+                    } catch (Exception e) {
+                        // Ignore - might have been deleted by another server
+                    }
                 }
             }
-        } catch (Exception e) { /* Ignore race conditions */ }
+        } catch (Exception e) {
+            // Ignore exceptions during pruning
+        }
     }
 
     @Override
@@ -299,7 +394,6 @@ public class MyDBFaultTolerantServerZK extends MyDBSingleServer implements Watch
         } catch (Exception e) {}
     }
 
-    // Main entry point logic matches prompt requirements
     public static void main(String[] args) throws IOException {
         new MyDBFaultTolerantServerZK(NodeConfigUtils.getNodeConfigFromFile
                 (args[0], ReplicatedServer.SERVER_PREFIX, ReplicatedServer
