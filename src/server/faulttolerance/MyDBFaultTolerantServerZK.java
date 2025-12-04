@@ -30,7 +30,9 @@ import java.util.logging.Level;
 
 /**
  * Robust Fault-Tolerant Server using ZooKeeper.
- * Includes Retry Logic to prevent dropped requests during startup/crashes.
+ * Fixes:
+ * 1. Infinite Retry on Checkpoint Loading (Prevents empty DB on restart).
+ * 2. Hard Reconnect logic for ZooKeeper.
  */
 public class MyDBFaultTolerantServerZK extends MyDBSingleServer implements Watcher {
 
@@ -38,7 +40,7 @@ public class MyDBFaultTolerantServerZK extends MyDBSingleServer implements Watch
     public static final int SLEEP = 1000;
     public static final boolean DROP_TABLES_AFTER_TESTS = true;
     public static final int MAX_LOG_SIZE = 400;
-    private static final String ZK_HOST = "localhost:2181";
+    private static final String ZK_HOST = "127.0.0.1:2181";
 
     // --- ZK Paths ---
     private static final String ROOT_PATH = "/ops";
@@ -50,15 +52,13 @@ public class MyDBFaultTolerantServerZK extends MyDBSingleServer implements Watch
     // --- Components ---
     protected static final Logger log = Logger.getLogger(MyDBFaultTolerantServerZK.class.getName());
     private final String myID;
-    private final ZooKeeper zk;
+    private volatile ZooKeeper zk;
     private final Session session;
     private final Cluster cluster;
 
     // --- State ---
     private long nextReqId = 0;
     private final ConcurrentHashMap<Long, NIOHeader> pendingClientRequests = new ConcurrentHashMap<>();
-    
-    // Lock for wait/notify logic
     private final Object lock = new Object();
     private volatile boolean running = true;
 
@@ -72,17 +72,45 @@ public class MyDBFaultTolerantServerZK extends MyDBSingleServer implements Watch
         session = cluster.connect(myID);
         ensureCheckpointTable();
 
-        // 2. Connect ZK
-        zk = new ZooKeeper(ZK_HOST, 3000, this);
+        // 2. Connect Zookeeper (Infinite Retry Loop)
+        while (running) {
+            try {
+                this.zk = new ZooKeeper(ZK_HOST, 3000, this);
+                createPathIfNeeded(ROOT_PATH); // Test connection
+                createPathIfNeeded(LOG_PATH);
+                createPathIfNeeded(STATUS_PATH);
+                break;
+            } catch (Exception e) {
+                try { if(this.zk != null) this.zk.close(); } catch(Exception ignored){}
+                try { Thread.sleep(500); } catch (InterruptedException ignored) {}
+            }
+        }
 
-        // 3. Setup Paths (blocks until ZK is ready)
-        setupZNodes();
-
-        // 4. Recover State
+        // 3. Recover State (MUST Succeed before processing)
         recoverState();
 
-        // 5. Start Engine
+        // 4. Start Engine
         new Thread(this::processRequestsLoop).start();
+    }
+
+    private synchronized ZooKeeper getZk() {
+        if (zk == null || zk.getState() == ZooKeeper.States.CLOSED || zk.getState() == ZooKeeper.States.AUTH_FAILED) {
+            try {
+                if (zk != null) zk.close();
+                zk = new ZooKeeper(ZK_HOST, 3000, this);
+                Thread.sleep(200); 
+            } catch (Exception e) {}
+        }
+        return zk;
+    }
+
+    private void createPathIfNeeded(String path) throws KeeperException, InterruptedException {
+        ZooKeeper client = getZk();
+        if (client.exists(path, false) == null) {
+            try {
+                client.create(path, new byte[0], ZooDefs.Ids.OPEN_ACL_UNSAFE, CreateMode.PERSISTENT);
+            } catch (KeeperException.NodeExistsException ignored) {}
+        }
     }
 
     private void ensureCheckpointTable() {
@@ -91,58 +119,40 @@ public class MyDBFaultTolerantServerZK extends MyDBSingleServer implements Watch
         } catch (Exception e) { e.printStackTrace(); }
     }
 
-    /**
-     * Blocks until ZK is connected and paths are created.
-     */
-    private void setupZNodes() {
-        boolean ready = false;
-        while (!ready && running) {
-            try {
-                ensurePathExists(ROOT_PATH);
-                ensurePathExists(LOG_PATH);
-                ensurePathExists(STATUS_PATH);
-                ready = true;
-            } catch (Exception e) {
-                // ZK not ready? Sleep and retry.
-                try { Thread.sleep(100); } catch (InterruptedException ignored) {}
-            }
-        }
-    }
-
-    private void ensurePathExists(String path) throws KeeperException, InterruptedException {
-        if (zk.exists(path, false) == null) {
-            try {
-                zk.create(path, new byte[0], ZooDefs.Ids.OPEN_ACL_UNSAFE, CreateMode.PERSISTENT);
-            } catch (KeeperException.NodeExistsException ignored) {}
-        }
-    }
-
     private void recoverState() {
-        try {
-            String myStatusPath = STATUS_PATH + "/" + myID;
-            if (zk.exists(myStatusPath, false) != null) {
-                byte[] data = zk.getData(myStatusPath, false, null);
-                long lastExecuted = Long.parseLong(new String(data, StandardCharsets.UTF_8));
+        // Retry loop to ensure we don't start with partial state
+        while (running) {
+            try {
+                String myStatusPath = STATUS_PATH + "/" + myID;
+                ZooKeeper client = getZk();
                 
-                // RESTORE CHECKPOINT FIRST
-                loadCheckpoint();
-                
-                this.nextReqId = lastExecuted + 1;
-                log.info(myID + " recovered. Next ID: " + nextReqId);
-            } else {
-                zk.create(myStatusPath, "-1".getBytes(), ZooDefs.Ids.OPEN_ACL_UNSAFE, CreateMode.PERSISTENT);
-                this.nextReqId = getMinLogIdFromZK();
-                loadCheckpoint(); // Just in case
-                log.info(myID + " fresh start. Next ID: " + nextReqId);
+                if (client.exists(myStatusPath, false) != null) {
+                    byte[] data = client.getData(myStatusPath, false, null);
+                    long lastExecuted = Long.parseLong(new String(data, StandardCharsets.UTF_8));
+                    
+                    // Critical: Must load checkpoint successfully
+                    if (loadCheckpoint()) {
+                        this.nextReqId = lastExecuted + 1;
+                        log.info(myID + " recovered. Next ID: " + nextReqId);
+                        return;
+                    }
+                } else {
+                    client.create(myStatusPath, "-1".getBytes(), ZooDefs.Ids.OPEN_ACL_UNSAFE, CreateMode.PERSISTENT);
+                    this.nextReqId = getMinLogIdFromZK();
+                    loadCheckpoint(); // Try load even if fresh, just in case
+                    log.info(myID + " fresh start. Next ID: " + nextReqId);
+                    return;
+                }
+            } catch (Exception e) {
+                log.warning(myID + " recovery failed. Retrying...");
+                try { Thread.sleep(1000); } catch (InterruptedException ignored) {}
             }
-        } catch (Exception e) {
-            e.printStackTrace();
         }
     }
 
     private long getMinLogIdFromZK() {
         try {
-            List<String> children = zk.getChildren(LOG_PATH, false);
+            List<String> children = getZk().getChildren(LOG_PATH, false);
             if (children.isEmpty()) return 0;
             List<Long> ids = new ArrayList<>();
             for (String c : children) {
@@ -153,17 +163,15 @@ public class MyDBFaultTolerantServerZK extends MyDBSingleServer implements Watch
         } catch (Exception e) { return 0; }
     }
 
-    /**
-     * FIXED: Includes retry logic to handle ZK disconnects without dropping requests.
-     */
     @Override
     protected void handleMessageFromClient(byte[] bytes, NIOHeader header) {
         String request = new String(bytes, StandardCharsets.UTF_8);
-        int retries = 10; 
+        int retries = 20; 
         
         while (retries-- > 0 && running) {
             try {
-                String path = zk.create(LOG_PATH + "/" + LOG_PREFIX,
+                ZooKeeper client = getZk();
+                String path = client.create(LOG_PATH + "/" + LOG_PREFIX,
                         request.getBytes(StandardCharsets.UTF_8),
                         ZooDefs.Ids.OPEN_ACL_UNSAFE,
                         CreateMode.PERSISTENT_SEQUENTIAL);
@@ -173,41 +181,33 @@ public class MyDBFaultTolerantServerZK extends MyDBSingleServer implements Watch
                 
                 pendingClientRequests.put(seqId, header);
                 synchronized (lock) { lock.notifyAll(); }
-                return; // Success!
+                return;
 
-            } catch (KeeperException.ConnectionLossException | KeeperException.SessionExpiredException e) {
-                // ZK is blinking. Sleep briefly and retry.
-                try { Thread.sleep(200); } catch (InterruptedException ignored) {}
             } catch (Exception e) {
-                e.printStackTrace();
-                break; // Fatal error, give up
+                try { Thread.sleep(200); } catch (InterruptedException ignored) {}
             }
         }
-        log.severe(myID + " FAILED to propose request after retries: " + request);
     }
 
     private void processRequestsLoop() {
         while (running) {
             try {
                 String expectedPath = LOG_PATH + "/" + LOG_PREFIX + String.format("%010d", nextReqId);
-                Stat stat = zk.exists(expectedPath, this);
+                ZooKeeper client = getZk();
+                Stat stat = client.exists(expectedPath, this);
 
                 if (stat != null) {
-                    byte[] data = zk.getData(expectedPath, false, null);
+                    byte[] data = client.getData(expectedPath, false, null);
                     executeRequestAndNotify(nextReqId, new String(data, StandardCharsets.UTF_8));
-                    
                     updateCheckpoint(nextReqId);
                     
-                    if (nextReqId > 0 && nextReqId % MAX_LOG_SIZE == 0) {
-                        createCheckpoint(nextReqId);
-                    }
+                    if (nextReqId > 0 && nextReqId % MAX_LOG_SIZE == 0) createCheckpoint(nextReqId);
                     if (nextReqId % 10 == 0) garbageCollectLogs();
                     
                     nextReqId++;
                 } else {
                     long minLog = getMinLogIdFromZK();
                     if (minLog > nextReqId) {
-                        log.warning(myID + " detected gap. Jumping " + nextReqId + " -> " + minLog);
                         nextReqId = minLog;
                         continue;
                     }
@@ -225,16 +225,13 @@ public class MyDBFaultTolerantServerZK extends MyDBSingleServer implements Watch
         try {
             jsonReq = new JSONObject(payload);
             if(jsonReq.has("REQUEST")) command = jsonReq.getString("REQUEST");
-        } catch (JSONException ignored) {
-            command = payload;
-        }
+        } catch (JSONException ignored) { command = payload; }
 
         String responseMsg = "Executed";
         try {
             if (session != null && !session.isClosed()) session.execute(command);
         } catch (Exception e) {
             responseMsg = "Error";
-            e.printStackTrace();
         }
 
         NIOHeader clientHeader = pendingClientRequests.remove(reqId);
@@ -256,7 +253,7 @@ public class MyDBFaultTolerantServerZK extends MyDBSingleServer implements Watch
 
     private void updateCheckpoint(long executedId) {
         try {
-            zk.setData(STATUS_PATH + "/" + myID, Long.toString(executedId).getBytes(), -1);
+            getZk().setData(STATUS_PATH + "/" + myID, Long.toString(executedId).getBytes(), -1);
         } catch (Exception ignored) {}
     }
 
@@ -287,20 +284,22 @@ public class MyDBFaultTolerantServerZK extends MyDBSingleServer implements Watch
 
             String stateString = checkpointObj.toString().replace("'", "''");
             session.execute("INSERT INTO " + CHECKPOINT_TABLE + " (replica, state) VALUES ('" + myID + "', '" + stateString + "')");
-            
-            log.info(myID + " created checkpoint at " + checkpointReqId);
+            updateCheckpoint(checkpointReqId);
         } catch (Exception e) { e.printStackTrace(); }
     }
 
-    private void loadCheckpoint() {
+    /**
+     * Returns true if load was successful (or no checkpoint exists), false if failed.
+     */
+    private boolean loadCheckpoint() {
         try {
             ResultSet rs = session.execute("SELECT state FROM " + CHECKPOINT_TABLE + " WHERE replica = '" + myID + "'");
             Row r = rs.one();
-            if (r == null) return;
+            if (r == null) return true; // No checkpoint to load, success
 
             JSONObject checkpointObj = new JSONObject(r.getString("state"));
             JSONObject snapshot = checkpointObj.optJSONObject("snapshot");
-            if (snapshot == null) return;
+            if (snapshot == null) return true;
 
             Iterator<String> keys = snapshot.keys();
             while (keys.hasNext()) {
@@ -314,25 +313,30 @@ public class MyDBFaultTolerantServerZK extends MyDBSingleServer implements Watch
                 }
             }
             log.info(myID + " loaded checkpoint.");
-        } catch (Exception e) { e.printStackTrace(); }
+            return true;
+        } catch (Exception e) {
+            e.printStackTrace();
+            return false; // Failed to load, must retry
+        }
     }
 
     private void garbageCollectLogs() {
         try {
-            List<String> servers = zk.getChildren(STATUS_PATH, false);
+            ZooKeeper client = getZk();
+            List<String> servers = client.getChildren(STATUS_PATH, false);
             long minExecuted = Long.MAX_VALUE;
             for (String s : servers) {
                 try {
-                    long val = Long.parseLong(new String(zk.getData(STATUS_PATH + "/" + s, false, null)));
+                    long val = Long.parseLong(new String(client.getData(STATUS_PATH + "/" + s, false, null)));
                     if (val < minExecuted) minExecuted = val;
                 } catch (Exception ignored) {}
             }
             long threshold = minExecuted - MAX_LOG_SIZE;
             if (threshold < 0) return;
 
-            for (String node : zk.getChildren(LOG_PATH, false)) {
+            for (String node : client.getChildren(LOG_PATH, false)) {
                 try {
-                    if (Long.parseLong(node.substring(LOG_PREFIX.length())) < threshold) zk.delete(LOG_PATH + "/" + node, -1);
+                    if (Long.parseLong(node.substring(LOG_PREFIX.length())) < threshold) client.delete(LOG_PATH + "/" + node, -1);
                 } catch (Exception ignored) {}
             }
         } catch (Exception ignored) {}
