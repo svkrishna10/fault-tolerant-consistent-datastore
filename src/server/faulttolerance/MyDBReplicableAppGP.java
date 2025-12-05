@@ -46,7 +46,7 @@ public class MyDBReplicableAppGP implements Replicable {
         
         // 1. Connect to Cassandra
         // We handle optional args for host/port if provided, else default
-        String host = "localhost";
+        String host = "127.0.0.1";
         int port = 9042;
         
         this.cluster = Cluster.builder()
