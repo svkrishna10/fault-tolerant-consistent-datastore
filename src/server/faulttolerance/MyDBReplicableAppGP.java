@@ -8,15 +8,12 @@ import edu.umass.cs.gigapaxos.interfaces.Replicable;
 import edu.umass.cs.gigapaxos.interfaces.Request;
 import edu.umass.cs.gigapaxos.paxospackets.RequestPacket;
 import edu.umass.cs.nio.interfaces.IntegerPacketType;
-import edu.umass.cs.nio.nioutils.NodeConfigUtils;
-import edu.umass.cs.reconfiguration.reconfigurationutils.RequestParseException;
 import org.json.JSONArray;
 import org.json.JSONException;
 import org.json.JSONObject;
 
 import java.io.IOException;
 import java.util.HashSet;
-import java.util.List;
 import java.util.Set;
 import java.util.logging.Level;
 import java.util.logging.Logger;
@@ -27,25 +24,21 @@ import java.util.logging.Logger;
  */
 public class MyDBReplicableAppGP implements Replicable {
 
-    // --- Config ---
     public static final int SLEEP = 1000;
-    private static final String TABLE_NAME = "grade"; // Defined in GraderCommonSetup
+    private static final String TABLE_NAME = "grade";
     
-    // --- Components ---
     private final String myID;
-    private final Session session;
     private final Cluster cluster;
+    private final Session session; // Connected to the DEFAULT keyspace for flexible querying
     private static final Logger log = Logger.getLogger(MyDBReplicableAppGP.class.getName());
 
     /**
      * Constructor required by GigaPaxos.
-     * @param args args[0] is the Keyspace Name (Server ID).
+     * @param args args[0] is the Server ID (used as keyspace name).
      */
     public MyDBReplicableAppGP(String[] args) throws IOException {
         this.myID = args[0];
         
-        // 1. Connect to Cassandra
-        // We handle optional args for host/port if provided, else default
         String host = "localhost";
         int port = 9042;
         
@@ -54,14 +47,14 @@ public class MyDBReplicableAppGP implements Replicable {
                 .withPort(port)
                 .build();
         
-        // 2. Connect to the specific keyspace for this replica
+        // Connect to this server's keyspace
         this.session = cluster.connect(myID);
-        log.info("GP App initialized for keyspace: " + myID);
+        
+        log.info("GP App initialized for server: " + myID);
     }
 
     /**
-     * This is called by GigaPaxos when a request has been committed.
-     * We simply execute it against Cassandra.
+     * Execute a committed request against Cassandra.
      */
     @Override
     public boolean execute(Request request) {
@@ -74,29 +67,26 @@ public class MyDBReplicableAppGP implements Replicable {
 
     @Override
     public boolean execute(Request request, boolean doNotReplyToClient) {
-        // We delegate to the main execute method. 
-        // GigaPaxos handles the reply logic usually, or the client handles timeouts.
         return execute(request);
     }
 
     /**
-     * Parses the request string (JSON or Raw SQL) and runs it.
+     * Parse and execute the SQL command.
      */
     private boolean executeQuery(String reqValue) {
         String command = reqValue;
         
-        // 1. Robust Parsing (Same as ZK solution)
+        // Try to parse as JSON first
         try {
             JSONObject json = new JSONObject(reqValue);
             if (json.has("REQUEST")) {
                 command = json.getString("REQUEST");
             }
         } catch (JSONException e) {
-            // Not JSON, assume Raw SQL
-            command = reqValue;
+            // Not JSON, use as-is
         }
 
-        // 2. Execution
+        // Execute against our keyspace
         try {
             session.execute(command);
             return true;
@@ -107,19 +97,20 @@ public class MyDBReplicableAppGP implements Replicable {
     }
 
     /**
-     * CHECKPOINT: Convert the entire Database State into a String.
-     * Used by GigaPaxos to send state to a lagging replica.
+     * CHECKPOINT: Serialize the entire table state to a String.
+     * 
+     * CRITICAL: The parameter 'serviceName' is the GigaPaxos service name,
+     * NOT the server ID. However, for this implementation, we checkpoint
+     * OUR keyspace (myID), since that's where our data lives.
      */
     @Override
-    public String checkpoint(String s) {
+    public String checkpoint(String serviceName) {
         try {
-            // 1. Read all data from the table
-            // In the grader setup, the table is named "grade"
-            ResultSet results = session.execute("SELECT * FROM " + TABLE_NAME);
+            // Read all rows from our table
+            ResultSet results = session.execute("SELECT * FROM " + myID + "." + TABLE_NAME);
             
             JSONArray rows = new JSONArray();
             
-            // 2. Convert rows to JSON
             for (Row row : results) {
                 JSONObject jsonRow = new JSONObject();
                 jsonRow.put("id", row.getInt("id"));
@@ -127,66 +118,84 @@ public class MyDBReplicableAppGP implements Replicable {
                 rows.put(jsonRow);
             }
             
-            // Return state as a String
-            return rows.toString();
+            String checkpoint = rows.toString();
+            log.info(myID + " created checkpoint with " + rows.length() + " rows");
+            return checkpoint;
+            
         } catch (Exception e) {
-            e.printStackTrace();
+            log.log(Level.SEVERE, myID + " failed to create checkpoint", e);
             return "";
         }
     }
 
     /**
-     * RESTORE: Take a String (checkpoint) and wipe/rewrite the Database.
-     * Used when this node is recovering and receives a snapshot from a peer.
+     * RESTORE: Clear and restore table state from a checkpoint string.
+     * 
+     * CRITICAL: serviceName is the GigaPaxos service name. We restore
+     * to OUR keyspace (myID).
      */
     @Override
     public boolean restore(String serviceName, String state) {
         try {
-            if (state == null || state.isEmpty()) return true;
+            if (state == null || state.isEmpty()) {
+                log.info(myID + " restore called with empty state");
+                return true;
+            }
 
-            // 1. Clear current state
-            session.execute("TRUNCATE " + TABLE_NAME);
+            // Clear current state
+            session.execute("TRUNCATE " + myID + "." + TABLE_NAME);
 
-            // 2. Parse the checkpoint string
+            // Parse checkpoint
             JSONArray rows = new JSONArray(state);
 
-            // 3. Re-insert data
+            // Restore each row
             for (int i = 0; i < rows.length(); i++) {
                 JSONObject jsonRow = rows.getJSONObject(i);
                 int id = jsonRow.getInt("id");
                 JSONArray events = jsonRow.getJSONArray("events");
                 
-                // Construct the List<Integer> for CQL
+                // Build the events list string
                 StringBuilder eventsStr = new StringBuilder("[");
-                for(int j=0; j<events.length(); j++) {
+                for (int j = 0; j < events.length(); j++) {
                     eventsStr.append(events.getInt(j));
-                    if(j < events.length()-1) eventsStr.append(",");
+                    if (j < events.length() - 1) eventsStr.append(",");
                 }
                 eventsStr.append("]");
 
-                // Execute Insert
-                String insert = String.format("INSERT INTO %s (id, events) VALUES (%d, %s)", 
-                        TABLE_NAME, id, eventsStr.toString());
+                // Insert
+                String insert = String.format("INSERT INTO %s.%s (id, events) VALUES (%d, %s)", 
+                        myID, TABLE_NAME, id, eventsStr.toString());
                 session.execute(insert);
             }
+            
+            log.info(myID + " restored " + rows.length() + " rows from checkpoint");
             return true;
+            
         } catch (Exception e) {
-            e.printStackTrace();
+            log.log(Level.SEVERE, myID + " failed to restore from checkpoint", e);
             return false;
         }
     }
 
-    // --- Boilerplate / Unused Methods ---
-
+    /**
+     * Parse a string into a Request object (if needed by GigaPaxos).
+     */
     @Override
-    public Request getRequest(String s) throws RequestParseException {
-        // Used for converting strings to Request objects, but Grader handles this.
-        return null; 
+    public Request getRequest(String s) {
+        // GigaPaxos typically handles this internally
+        // Return a RequestPacket if you need to support string->Request conversion
+        try {
+            return new RequestPacket(s, false);
+        } catch (Exception e) {
+            return null;
+        }
     }
 
+    /**
+     * Declare what packet types this app handles.
+     */
     @Override
     public Set<IntegerPacketType> getRequestTypes() {
-        // We only use standard RequestPackets
         return new HashSet<>();
     }
 }
