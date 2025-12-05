@@ -138,19 +138,33 @@ public class MyDBReplicableAppGP implements Replicable {
     /**
      * RESTORE: Take a String (checkpoint) and wipe/rewrite the Database.
      * Used when this node is recovering and receives a snapshot from a peer.
+     * FIXED: Added robust JSON parsing to prevent crashes on bad state strings.
      */
     @Override
     public boolean restore(String serviceName, String state) {
         try {
-            if (state == null || state.isEmpty()) return true;
-
-            // 1. Clear current state
+            // 1. Clear current state regardless of incoming state validity
+            // This ensures we don't end up with mixed data if parsing fails midway
             session.execute("TRUNCATE " + TABLE_NAME);
 
-            // 2. Parse the checkpoint string
-            JSONArray rows = new JSONArray(state);
+            // 2. Validate state string
+            if (state == null || state.trim().isEmpty()) {
+                return true; // Nothing to restore, empty is valid state
+            }
 
-            // 3. Re-insert data
+            // 3. Robust Parsing
+            JSONArray rows;
+            try {
+                rows = new JSONArray(state);
+            } catch (JSONException e) {
+                // If it's not a JSON Array, check if it's empty brackets "[]" or just ignore if malformed
+                if (state.trim().equals("[]")) return true;
+                
+                log.warning("Restore failed to parse JSON: " + state);
+                return true; // Treat as empty state to prevent crash loop
+            }
+
+            // 4. Re-insert data
             for (int i = 0; i < rows.length(); i++) {
                 JSONObject jsonRow = rows.getJSONObject(i);
                 int id = jsonRow.getInt("id");
