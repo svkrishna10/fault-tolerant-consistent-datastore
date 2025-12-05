@@ -124,7 +124,8 @@ public class MyDBReplicableAppGP implements Replicable {
             
         } catch (Exception e) {
             log.log(Level.SEVERE, myID + " failed to create checkpoint", e);
-            return "";
+            // Return empty JSON array, NOT empty string
+            return "[]";
         }
     }
 
@@ -137,8 +138,10 @@ public class MyDBReplicableAppGP implements Replicable {
     @Override
     public boolean restore(String serviceName, String state) {
         try {
-            if (state == null || state.isEmpty()) {
-                log.info(myID + " restore called with empty state");
+            // Handle empty or null state
+            if (state == null || state.trim().isEmpty() || state.equals("[]")) {
+                log.info(myID + " restore called with empty state, clearing table");
+                session.execute("TRUNCATE " + myID + "." + TABLE_NAME);
                 return true;
             }
 
@@ -172,7 +175,7 @@ public class MyDBReplicableAppGP implements Replicable {
             return true;
             
         } catch (Exception e) {
-            log.log(Level.SEVERE, myID + " failed to restore from checkpoint", e);
+            log.log(Level.SEVERE, myID + " failed to restore from checkpoint: " + state, e);
             return false;
         }
     }
